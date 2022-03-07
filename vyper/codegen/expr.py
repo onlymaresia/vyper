@@ -401,10 +401,11 @@ class Expr:
         elif isinstance(self.expr.value, vy_ast.Name) and self.expr.value.id == "self":
             type_ = self.expr._metadata["type"]
             var = self.context.globals[self.expr.attr]
+            location = "transient" if var.is_transient else "storage"
             return LLLnode.from_list(
                 type_.position.position,
                 typ=var.typ,
-                location="storage",
+                location=location,
                 pos=getpos(self.expr),
                 annotation="self." + self.expr.attr,
             )

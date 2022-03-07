@@ -117,7 +117,7 @@ def make_byte_array_copier(dst, src, pos=None):
 def wordsize(location):
     if location in ("memory", "calldata", "data", "immutables"):
         return 32
-    if location == "storage":
+    if location in ("storage", "transient"):
         return 1
     raise CompilerPanic(f"invalid location {location}")  # pragma: notest
 
@@ -266,17 +266,17 @@ def copy_bytes(dst, src, length, length_bound, pos=None):
 
         i = LLLnode.from_list(_freshname("copy_bytes_ix"), typ="uint256")
 
-        if src.location in ("memory", "calldata", "data", "immutables"):
+        if wordsize(src.location) == 32:
             loader = [load_op(src.location), ["add", src, _mul(32, i)]]
-        elif src.location == "storage":
+        elif wordsize(src.location) == 1:
             loader = [load_op(src.location), ["add", src, i]]
         else:
             raise CompilerPanic(f"Unsupported location: {src.location}")  # pragma: notest
 
-        if dst.location in ("memory", "immutables"):
+        if wordsize(dst.location) == 32:
             setter = [store_op(dst.location), ["add", dst, _mul(32, i)], loader]
-        elif dst.location == "storage":
-            setter = ["sstore", ["add", dst, i], loader]
+        elif wordsize(dst.location) == 1:
+            setter = [store_op(dst.location), ["add", dst, i], loader]
         else:
             raise CompilerPanic(f"Unsupported location: {dst.location}")  # pragma: notest
 
@@ -458,7 +458,7 @@ def _get_element_ptr_tuplelike(parent, key, pos):
 
         return _getelemptr_abi_helper(parent, member_t, ofst, pos)
 
-    if parent.location == "storage":
+    if parent.location in ("storage", "transient"):
         for i in range(index):
             ofst += typ.members[attrs[i]].storage_size_in_words
     elif parent.location in ("calldata", "memory", "data", "immutables"):
@@ -527,7 +527,7 @@ def _get_element_ptr_array(parent, key, pos, array_bounds_check):
 
         return _getelemptr_abi_helper(parent, subtype, ofst, pos)
 
-    if parent.location == "storage":
+    if parent.location in ("storage", "transient"):
         element_size = subtype.storage_size_in_words
     elif parent.location in ("calldata", "memory", "data", "immutables"):
         element_size = subtype.memory_bytes_required
@@ -550,10 +550,10 @@ def _get_element_ptr_mapping(parent, key, pos):
     key = unwrap_location(key)
 
     # TODO when is key None?
-    if key is None or parent.location != "storage":
+    if key is None or parent.location not in ("storage", "transient"):
         raise TypeCheckFailure("bad dereference on mapping {parent}[{sub}]")
 
-    return LLLnode.from_list(["sha3_64", parent, key], typ=subtype, location="storage")
+    return LLLnode.from_list(["sha3_64", parent, key], typ=subtype, location=parent.location)
 
 
 # Take a value representing a memory or storage location, and descend down to
@@ -592,6 +592,8 @@ def load_op(location):
         # special address space for manipulating immutables before deploy
         # only makes sense in a constructor
         return "iload"
+    if location == "transient":
+        return "tload"
     raise CompilerPanic(f"unreachable {location}")  # pragma: notest
 
 
@@ -602,12 +604,14 @@ def store_op(location):
         return "sstore"
     if location == "immutables":
         return "istore"
+    if location == "transient":
+        return "tstore"
     raise CompilerPanic(f"unreachable {location}")  # pragma: notest
 
 
 # Unwrap location
 def unwrap_location(orig):
-    if orig.location in ("memory", "storage", "calldata", "data", "immutables"):
+    if orig.location in ("memory", "storage", "calldata", "data", "immutables", "transient"):
         return LLLnode.from_list([load_op(orig.location), orig], typ=orig.typ)
     else:
         # CMC 20210909 TODO double check if this branch can be removed
