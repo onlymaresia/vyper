@@ -11,12 +11,14 @@ from vyper.exceptions import (
     InvalidLiteral,
     InvalidOperation,
     NamespaceCollision,
+    StateAccessViolation,
     StructureException,
     UnexpectedNodeType,
     UnexpectedValue,
     UnknownAttribute,
 )
 from vyper.semantics.types.abstract import AbstractDataType
+from vyper.semantics.validation.levenshtein_utils import get_levenshtein_error_suggestions
 
 
 class DataLocation(Enum):
@@ -208,7 +210,7 @@ class BasePrimitive:
         raise StructureException("Type is not callable", node)
 
     @classmethod
-    def get_index_type(self, node: vy_ast.Index) -> None:
+    def get_subscripted_type(self, node: vy_ast.Index) -> None:
         # always raises - do not implement in inherited classes
         raise StructureException("Types cannot be indexed", node)
 
@@ -218,7 +220,9 @@ class BasePrimitive:
         raise StructureException("Types do not have members", node)
 
     @classmethod
-    def validate_modification(cls, node: Union[vy_ast.Assign, vy_ast.AugAssign]) -> None:
+    def validate_modification(
+        cls, node: Union[vy_ast.Assign, vy_ast.AugAssign], mutability: Any
+    ) -> None:
         # always raises - do not implement in inherited classes
         raise InvalidOperation("Cannot assign to a type", node)
 
@@ -281,7 +285,7 @@ class BaseTypeDefinition:
         """
         return self.abi_type.selector_name()
 
-    def from_annotation(self, node: vy_ast.VyperNode, **kwargs: Any) -> None:
+    def from_annotation(self, node: vy_ast.VyperNode, *args: Any, **kwargs: Any) -> None:
         # always raises, user should have used a primitive
         raise StructureException("Value is not a type", node)
 
@@ -405,14 +409,25 @@ class BaseTypeDefinition:
         """
         raise StructureException("Value is not callable", node)
 
-    def get_index_type(self, node: vy_ast.Index) -> "BaseTypeDefinition":
+    def validate_index_type(self, node: vy_ast.Index) -> None:
         """
-        Validate an index reference and return the given type at the index.
+        Validate an index reference, e.g. x[1]. Raises if the index is invalid.
 
         Arguments
         ---------
         node : Index
             Vyper ast node from the `slice` member of a Subscript node.
+        """
+        raise StructureException(f"Type '{self}' does not support indexing", node)
+
+    def get_subscripted_type(self, node: vy_ast.Index) -> "BaseTypeDefinition":
+        """
+        Return the type of a subscript expression, e.g. x[1]
+
+        Arguments
+        ---------
+        node: Index
+            Vyper ast node from the `slice` member of a Subscript node
 
         Returns
         -------
@@ -440,7 +455,11 @@ class BaseTypeDefinition:
         """
         raise StructureException(f"Type '{self}' does not support members", node)
 
-    def validate_modification(self, node: Union[vy_ast.Assign, vy_ast.AugAssign]) -> None:
+    def validate_modification(
+        self,
+        node: Union[vy_ast.Assign, vy_ast.AugAssign, vy_ast.Call],
+        mutability: Any,  # should be StateMutability, import cycle
+    ) -> None:
         """
         Validate an attempt to modify this value.
 
@@ -448,9 +467,19 @@ class BaseTypeDefinition:
 
         Arguments
         ---------
-        node : Assign | AugAssign
+        node : Assign | AugAssign | Call
             Vyper ast node of the modifying action.
+        mutability: StateMutability
+            The mutability of the context (e.g., pure function) we are currently in
         """
+        # TODO: break this cycle, probably by moving this to validation module
+        from vyper.semantics.types.function import StateMutability
+
+        if mutability <= StateMutability.VIEW and self.location == DataLocation.STORAGE:
+            raise StateAccessViolation(
+                f"Cannot modify storage in a {mutability.value} function", node
+            )
+
         if self.location == DataLocation.CALLDATA:
             raise ImmutableViolation("Cannot write to calldata", node)
         if self.is_constant:
@@ -557,7 +586,8 @@ class MemberTypeDefinition(BaseTypeDefinition):
             type_.location = self.location
             type_.is_constant = self.is_constant
             return type_
-        raise UnknownAttribute(f"{self} has no member '{key}'", node)
+        suggestions_str = get_levenshtein_error_suggestions(key, self.members, 0.3)
+        raise UnknownAttribute(f"{self} has no member '{key}'. {suggestions_str}", node)
 
     def __repr__(self):
         return f"{self._id}"
@@ -595,3 +625,6 @@ class IndexableTypeDefinition(BaseTypeDefinition):
     def get_signature(self) -> Tuple[Tuple, Optional[BaseTypeDefinition]]:
         new_args, return_type = self.value_type.get_signature()
         return (self.key_type,) + new_args, return_type
+
+    def get_index_type(self):
+        return self.key_type

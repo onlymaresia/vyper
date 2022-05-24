@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 
+import os
 import re
+import subprocess
 
 from setuptools import find_packages, setup
 
@@ -9,7 +11,9 @@ extras_require = {
         "pytest>=6.2.5,<7.0",
         "pytest-cov>=2.10,<3.0",
         "pytest-instafail>=0.4,<1.0",
-        "pytest-xdist>=1.32,<2.0",
+        "pytest-xdist>=2.5,<3.0",
+        "pytest-split>=0.7.0,<1.0",
+        "pytest-rerunfailures>=10.2,<11",
         "eth-tester[py-evm]>=0.6.0b6,<0.7",
         "py-evm>=0.5.0a3,<0.6",
         "web3==5.27.0",
@@ -19,6 +23,7 @@ extras_require = {
     ],
     "lint": [
         "black==21.9b0",
+        "click<8.1.0",  # temporary pin - black21.9b0 fails with 8.1.0
         "flake8==3.9.2",
         "flake8-bugbear==20.1.4",
         "flake8-use-fstring==1.1",
@@ -37,14 +42,9 @@ with open("README.md", "r") as f:
     long_description = f.read()
 
 
-# force commit hash to be appended to version even when tag is exact
-# (breaks PEP 440, but this is the debug info, not the version tag for pypi)
+# strip local version
 def _local_version(version):
-    commithash = version.node[1:]  # git describe adds 'g' prefix
-    ret = f"+commit.{commithash}"
-    if version.dirty:
-        ret += "-dirty"
-    return ret
+    return ""
 
 
 def _global_version(version):
@@ -54,6 +54,22 @@ def _global_version(version):
     # minor regex hack to avoid messing too much with setuptools-scm internals
     version_str = guess_next_dev_version(version)
     return re.sub(r"\.dev\d+", "", version_str)
+
+
+hash_file_rel_path = os.path.join("vyper", "vyper_git_commithash.txt")
+hashfile = os.path.relpath(hash_file_rel_path)
+
+# there is no way in setuptools-scm to get metadata besides the package
+# version into version.py. (and we need that version to be PEP440 compliant
+# in order to get it into pypi). so, add the commit hash to the package
+# separately, in order so that we can add it to `vyper --version`.
+try:
+    commithash = subprocess.check_output("git rev-parse --short HEAD".split())
+    commithash_str = commithash.decode("utf-8").strip()
+    with open(hashfile, "w") as fh:
+        fh.write(commithash_str)
+except subprocess.CalledProcessError:
+    pass
 
 
 setup(
@@ -90,7 +106,7 @@ setup(
         "console_scripts": [
             "vyper=vyper.cli.vyper_compile:_parse_cli_args",
             "vyper-serve=vyper.cli.vyper_serve:_parse_cli_args",
-            "vyper-lll=vyper.cli.vyper_lll:_parse_cli_args",
+            "vyper-ir=vyper.cli.vyper_ir:_parse_cli_args",
             "vyper-json=vyper.cli.vyper_json:_parse_cli_args",
         ]
     },
@@ -102,4 +118,5 @@ setup(
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
     ],
+    data_files=[("", [hash_file_rel_path])],
 )

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Iterator, Set, TypeVar
 
 import vyper
-import vyper.codegen.lll_node as lll_node
+import vyper.codegen.ir_node as ir_node
 from vyper.cli import vyper_json
 from vyper.cli.utils import extract_file_interface_imports, get_interface_file_path
 from vyper.compiler.settings import VYPER_TRACEBACK_LIMIT
@@ -33,9 +33,9 @@ interface          - Vyper interface of a contract
 external_interface - External interface of a contract, used for outside contract calls
 opcodes            - List of opcodes as a string
 opcodes_runtime    - List of runtime opcodes as a string
-ir                 - Intermediate representation in LLL
-ir_json            - Intermediate LLL representation in JSON format
-ir-hex             - Output IR and assembly constants in hex instead of decimal
+ir                 - Intermediate representation in list format
+ir_json            - Intermediate representation in JSON format
+hex-ir             - Output IR and assembly constants in hex instead of decimal
 no-optimize        - Do not optimize (don't use this for production code)
 """
 
@@ -88,7 +88,7 @@ def _parse_args(argv):
     parser.add_argument(
         "--version",
         action="version",
-        version=vyper.__version__,
+        version=f"{vyper.__version__}+commit.{vyper.__commit__}",
     )
     parser.add_argument(
         "--show-gas-estimates",
@@ -137,7 +137,7 @@ def _parse_args(argv):
         action="store_true",
     )
     parser.add_argument(
-        "--ir-hex",
+        "--hex-ir",
         action="store_true",
     )
     parser.add_argument(
@@ -159,8 +159,8 @@ def _parse_args(argv):
         # an error occurred in a Vyper source file.
         sys.tracebacklimit = 0
 
-    if args.ir_hex:
-        lll_node.AS_HEX_DEFAULT = True
+    if args.hex_ir:
+        ir_node.AS_HEX_DEFAULT = True
 
     output_formats = tuple(uniq(args.format.split(",")))
 
@@ -302,7 +302,12 @@ def compile_files(
         output_formats = combined_json_outputs
         show_version = True
 
-    translate_map = {"abi_python": "abi", "json": "abi", "ast": "ast_dict", "ir_json": "ir_dict"}
+    translate_map = {
+        "abi_python": "abi",
+        "json": "abi",
+        "ast": "ast_dict",
+        "ir_json": "ir_dict",
+    }
     final_formats = [translate_map.get(i, i) for i in output_formats]
 
     compiler_data = vyper.compile_codes(

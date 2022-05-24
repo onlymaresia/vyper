@@ -1,26 +1,15 @@
 import copy
 import functools
 
-from vyper.codegen.lll_node import LLLnode
+from vyper.codegen.ir_node import IRnode
 from vyper.evm.opcodes import get_opcodes
 from vyper.exceptions import CodegenPanic, CompilerPanic
 from vyper.utils import MemoryPositions
+from vyper.version import version_tuple
 
 PUSH_OFFSET = 0x5F
 DUP_OFFSET = 0x7F
 SWAP_OFFSET = 0x8F
-
-
-CLAMP_OP_NAMES = {
-    "uclamplt",
-    "uclample",
-    "clamplt",
-    "clample",
-    "uclampgt",
-    "uclampge",
-    "clampgt",
-    "clampge",
-}
 
 
 def num_to_bytearray(x):
@@ -58,8 +47,8 @@ def mksymbol(name=""):
     return f"_sym_{name}{_next_symbol}"
 
 
-def mkdebug(pc_debugger, pos):
-    i = Instruction("DEBUG", pos)
+def mkdebug(pc_debugger, source_pos):
+    i = Instruction("DEBUG", source_pos)
     i.pc_debugger = pc_debugger
     return [i]
 
@@ -106,22 +95,22 @@ def _runtime_code_offsets(ctor_mem_size, runtime_codelen):
 # it assumes the arguments are already on the stack, to be replaced
 # by better liveness analysis.
 # NOTE: modifies input in-place
-def _rewrite_return_sequences(lll_node, label_params=None):
-    args = lll_node.args
+def _rewrite_return_sequences(ir_node, label_params=None):
+    args = ir_node.args
 
-    if lll_node.value == "return":
+    if ir_node.value == "return":
         if args[0].value == "ret_ofst" and args[1].value == "ret_len":
-            lll_node.args[0].value = "pass"
-            lll_node.args[1].value = "pass"
-    if lll_node.value == "exit_to":
+            ir_node.args[0].value = "pass"
+            ir_node.args[1].value = "pass"
+    if ir_node.value == "exit_to":
         # handle exit from private function
         if args[0].value == "return_pc":
-            lll_node.value = "jump"
+            ir_node.value = "jump"
             args[0].value = "pass"
         else:
             # handle jump to cleanup
             assert is_symbol(args[0].value)
-            lll_node.value = "seq"
+            ir_node.value = "seq"
 
             _t = ["seq"]
             if "return_buffer" in label_params:
@@ -130,10 +119,10 @@ def _rewrite_return_sequences(lll_node, label_params=None):
             dest = args[0].value[5:]  # `_sym_foo` -> `foo`
             more_args = ["pass" if t.value == "return_pc" else t for t in args[1:]]
             _t.append(["goto", dest] + more_args)
-            lll_node.args = LLLnode.from_list(_t, pos=lll_node.pos).args
+            ir_node.args = IRnode.from_list(_t, source_pos=ir_node.source_pos).args
 
-    if lll_node.value == "label":
-        label_params = set(t.value for t in lll_node.args[1].args)
+    if ir_node.value == "label":
+        label_params = set(t.value for t in ir_node.args[1].args)
 
     for t in args:
         _rewrite_return_sequences(t, label_params)
@@ -157,7 +146,7 @@ def _add_postambles(asm_ops):
 
     if len(to_append) > 0:
         # for some reason there might not be a STOP at the end of asm_ops.
-        # (generally vyper programs will have it but raw LLL might not).
+        # (generally vyper programs will have it but raw IR might not).
         asm_ops.append("STOP")
         asm_ops.extend(to_append)
 
@@ -172,10 +161,10 @@ class Instruction(str):
     def __new__(cls, sstr, *args, **kwargs):
         return super().__new__(cls, sstr)
 
-    def __init__(self, sstr, pos=None):
+    def __init__(self, sstr, source_pos=None):
         self.pc_debugger = False
-        if pos is not None:
-            self.lineno, self.col_offset, self.end_lineno, self.end_col_offset = pos
+        if source_pos is not None:
+            self.lineno, self.col_offset, self.end_lineno, self.end_col_offset = source_pos
         else:
             self.lineno, self.col_offset, self.end_lineno, self.end_col_offset = [None] * 4
 
@@ -186,7 +175,9 @@ def apply_line_numbers(func):
         code = args[0]
         ret = func(*args, **kwargs)
         new_ret = [
-            Instruction(i, code.pos) if isinstance(i, str) and not isinstance(i, Instruction) else i
+            Instruction(i, code.source_pos)
+            if isinstance(i, str) and not isinstance(i, Instruction)
+            else i
             for i in ret
         ]
         return new_ret
@@ -208,7 +199,7 @@ def compile_to_assembly(code, no_optimize=False):
     return res
 
 
-# Compiles LLL to assembly
+# Compiles IR to assembly
 @apply_line_numbers
 def _compile_to_assembly(code, withargs=None, existing_labels=None, break_dest=None, height=0):
     if withargs is None:
@@ -502,13 +493,14 @@ def _compile_to_assembly(code, withargs=None, existing_labels=None, break_dest=N
     # runtime statement (used to deploy runtime code)
     elif code.value == "deploy":
         memsize = code.args[0].value  # used later to calculate _mem_deploy_start
-        lll = code.args[1]
+        ir = code.args[1]
         padding = code.args[2].value
         assert isinstance(memsize, int), "non-int memsize"
         assert isinstance(padding, int), "non-int padding"
 
         begincode = mksymbol("runtime_begin")
-        subcode = _compile_to_assembly(lll, {}, existing_labels, None, 0)
+
+        subcode = _compile_to_assembly(ir)
 
         o = []
 
@@ -516,7 +508,7 @@ def _compile_to_assembly(code, withargs=None, existing_labels=None, break_dest=N
         o.extend(["_sym_subcode_size", begincode, "_mem_deploy_start", "CODECOPY"])
 
         # calculate the len of runtime code
-        o.extend(["_sym_subcode_size"] + PUSH(padding) + ["ADD"])  # stack: len
+        o.extend(["_OFST", "_sym_subcode_size", padding])  # stack: len
         o.extend(["_mem_deploy_start"])  # stack: len mem_ofst
         o.extend(["RETURN"])
 
@@ -530,7 +522,7 @@ def _compile_to_assembly(code, withargs=None, existing_labels=None, break_dest=N
         # `append(...)` call here is intentional.
         # each sublist is essentially its own program with its
         # own symbols.
-        # in the later step when the "lll" block compiled to EVM,
+        # in the later step when the "ir" block compiled to EVM,
         # symbols in subcode are resolved to position from start of
         # runtime-code (instead of position from start of bytecode).
         o.append(subcode)
@@ -558,98 +550,7 @@ def _compile_to_assembly(code, withargs=None, existing_labels=None, break_dest=N
         o.extend(["ISZERO"])
         o.extend(_assert_false())
         return o
-    # Unsigned/signed clamp, check less-than
-    elif code.value in CLAMP_OP_NAMES:
-        if isinstance(code.args[0].value, int) and isinstance(code.args[1].value, int):
-            # Checks for clamp errors at compile time as opposed to run time
-            # TODO move these to optimizer.py
-            args_0_val = code.args[0].value
-            args_1_val = code.args[1].value
-            is_free_of_clamp_errors = any(
-                (
-                    code.value in ("uclamplt", "clamplt") and 0 <= args_0_val < args_1_val,
-                    code.value in ("uclample", "clample") and 0 <= args_0_val <= args_1_val,
-                    code.value in ("uclampgt", "clampgt") and 0 <= args_0_val > args_1_val,
-                    code.value in ("uclampge", "clampge") and 0 <= args_0_val >= args_1_val,
-                )
-            )
-            if is_free_of_clamp_errors:
-                return _compile_to_assembly(
-                    code.args[0],
-                    withargs,
-                    existing_labels,
-                    break_dest,
-                    height,
-                )
-            else:
-                raise Exception(
-                    f"Invalid {code.value} with values {code.args[0]} and {code.args[1]}"
-                )
-        o = _compile_to_assembly(code.args[0], withargs, existing_labels, break_dest, height)
-        o.extend(
-            _compile_to_assembly(
-                code.args[1],
-                withargs,
-                existing_labels,
-                break_dest,
-                height + 1,
-            )
-        )
-        o.extend(["DUP2"])
-        # Stack: num num bound
-        if code.value == "uclamplt":
-            o.extend(["LT", "ISZERO"])
-        elif code.value == "clamplt":
-            o.extend(["SLT", "ISZERO"])
-        elif code.value == "uclample":
-            o.extend(["GT"])
-        elif code.value == "clample":
-            o.extend(["SGT"])
-        elif code.value == "uclampgt":
-            o.extend(["GT", "ISZERO"])
-        elif code.value == "clampgt":
-            o.extend(["SGT", "ISZERO"])
-        elif code.value == "uclampge":
-            o.extend(["LT"])
-        elif code.value == "clampge":
-            o.extend(["SLT"])
-        o.extend(_assert_false())
-        return o
-    # Signed clamp, check against upper and lower bounds
-    elif code.value in ("clamp", "uclamp"):
-        comp1 = "SGT" if code.value == "clamp" else "GT"
-        comp2 = "SLT" if code.value == "clamp" else "LT"
-        o = _compile_to_assembly(code.args[0], withargs, existing_labels, break_dest, height)
-        o.extend(
-            _compile_to_assembly(
-                code.args[1],
-                withargs,
-                existing_labels,
-                break_dest,
-                height + 1,
-            )
-        )
-        o.extend(["DUP1"])
-        o.extend(
-            _compile_to_assembly(
-                code.args[2],
-                withargs,
-                existing_labels,
-                break_dest,
-                height + 3,
-            )
-        )
-        o.extend(["SWAP1", comp1])
-        o.extend(_assert_false())
-        o.extend(["DUP1", "SWAP2", "SWAP1", comp2])
-        o.extend(_assert_false())
-        return o
-    # Checks that a value is nonzero
-    elif code.value == "clamp_nonzero":
-        o = _compile_to_assembly(code.args[0], withargs, existing_labels, break_dest, height)
-        o.extend(["DUP1", "ISZERO"])
-        o.extend(_assert_false())
-        return o
+
     # SHA3 a single value
     elif code.value == "sha3_32":
         o = _compile_to_assembly(code.args[0], withargs, existing_labels, break_dest, height)
@@ -709,7 +610,7 @@ def _compile_to_assembly(code, withargs=None, existing_labels=None, break_dest=N
     # <= operator
     elif code.value == "le":
         return _compile_to_assembly(
-            LLLnode.from_list(["iszero", ["gt", code.args[0], code.args[1]]]),
+            IRnode.from_list(["iszero", ["gt", code.args[0], code.args[1]]]),
             withargs,
             existing_labels,
             break_dest,
@@ -718,7 +619,7 @@ def _compile_to_assembly(code, withargs=None, existing_labels=None, break_dest=N
     # >= operator
     elif code.value == "ge":
         return _compile_to_assembly(
-            LLLnode.from_list(["iszero", ["lt", code.args[0], code.args[1]]]),
+            IRnode.from_list(["iszero", ["lt", code.args[0], code.args[1]]]),
             withargs,
             existing_labels,
             break_dest,
@@ -727,7 +628,7 @@ def _compile_to_assembly(code, withargs=None, existing_labels=None, break_dest=N
     # <= operator
     elif code.value == "sle":
         return _compile_to_assembly(
-            LLLnode.from_list(["iszero", ["sgt", code.args[0], code.args[1]]]),
+            IRnode.from_list(["iszero", ["sgt", code.args[0], code.args[1]]]),
             withargs,
             existing_labels,
             break_dest,
@@ -736,7 +637,7 @@ def _compile_to_assembly(code, withargs=None, existing_labels=None, break_dest=N
     # >= operator
     elif code.value == "sge":
         return _compile_to_assembly(
-            LLLnode.from_list(["iszero", ["slt", code.args[0], code.args[1]]]),
+            IRnode.from_list(["iszero", ["slt", code.args[0], code.args[1]]]),
             withargs,
             existing_labels,
             break_dest,
@@ -745,30 +646,26 @@ def _compile_to_assembly(code, withargs=None, existing_labels=None, break_dest=N
     # != operator
     elif code.value == "ne":
         return _compile_to_assembly(
-            LLLnode.from_list(["iszero", ["eq", code.args[0], code.args[1]]]),
+            IRnode.from_list(["iszero", ["eq", code.args[0], code.args[1]]]),
             withargs,
             existing_labels,
             break_dest,
             height,
         )
+
     # e.g. 95 -> 96, 96 -> 96, 97 -> 128
     elif code.value == "ceil32":
+        # floor32(x) = x - x % 32 == x & 0b11..100000 == x & (~31)
+        # ceil32(x) = floor32(x + 31) == (x + 31) & (~31)
+        x = code.args[0]
         return _compile_to_assembly(
-            LLLnode.from_list(
-                [
-                    "with",
-                    "_val",
-                    code.args[0],
-                    # in mod32 arithmetic, the solution to x + y == 32 is
-                    # y = bitwise_not(x) & 31
-                    ["add", "_val", ["and", ["not", ["sub", "_val", 1]], 31]],
-                ]
-            ),
+            IRnode.from_list(["and", ["add", x, 31], ["not", 31]]),
             withargs,
             existing_labels,
             break_dest,
             height,
         )
+
     # jump to a symbol, and push variable # of arguments onto stack
     elif code.value == "goto":
         o = []
@@ -821,10 +718,10 @@ def _compile_to_assembly(code, withargs=None, existing_labels=None, break_dest=N
 
     # inject debug opcode.
     elif code.value == "debugger":
-        return mkdebug(pc_debugger=False, pos=code.pos)
+        return mkdebug(pc_debugger=False, source_pos=code.source_pos)
     # inject debug opcode.
     elif code.value == "pc_debugger":
-        return mkdebug(pc_debugger=True, pos=code.pos)
+        return mkdebug(pc_debugger=True, source_pos=code.source_pos)
     else:
         raise Exception("Weird code element: " + repr(code))
 
@@ -853,23 +750,28 @@ def note_breakpoint(line_number_map, item, pos):
 
 
 def _prune_unreachable_code(assembly):
-    # In converting LLL to assembly we sometimes end up with unreachable
+    # In converting IR to assembly we sometimes end up with unreachable
     # instructions - POPing to clear the stack or STOPing execution at the
     # end of a function that has already returned or reverted. This should
-    # be addressed in the LLL, but for now we do a final sanity check here
+    # be addressed in the IR, but for now we do a final sanity check here
     # to avoid unnecessary bytecode bloat.
+    changed = False
     i = 0
     while i < len(assembly) - 1:
         if assembly[i] in ("JUMP", "RETURN", "REVERT", "STOP") and not (
             is_symbol(assembly[i + 1]) or assembly[i + 1] == "JUMPDEST"
         ):
+            changed = True
             del assembly[i + 1]
         else:
             i += 1
 
+    return changed
+
 
 def _prune_inefficient_jumps(assembly):
     # prune sequences `_sym_x JUMP _sym_x JUMPDEST` to `_sym_x JUMPDEST`
+    changed = False
     i = 0
     while i < len(assembly) - 4:
         if (
@@ -879,9 +781,12 @@ def _prune_inefficient_jumps(assembly):
             and assembly[i + 3] == "JUMPDEST"
         ):
             # delete _sym_x JUMP
+            changed = True
             del assembly[i : i + 2]
         else:
             i += 1
+
+    return changed
 
 
 def _merge_jumpdests(assembly):
@@ -890,6 +795,7 @@ def _merge_jumpdests(assembly):
     # intermediate jumps.
     # (Usually a chain of JUMPs is created by a nested block,
     # or some nested if statements.)
+    changed = False
     i = 0
     while i < len(assembly) - 3:
         if is_symbol(assembly[i]) and assembly[i + 1] == "JUMPDEST":
@@ -902,6 +808,7 @@ def _merge_jumpdests(assembly):
                 for j in range(len(assembly)):
                     if assembly[j] == current_symbol and i != j:
                         assembly[j] = new_symbol
+                        changed = True
             elif is_symbol(assembly[i + 2]) and assembly[i + 3] == "JUMP":
                 # _sym_x JUMPDEST _sym_y JUMP
                 # replace all instances of _sym_x with _sym_y
@@ -910,14 +817,20 @@ def _merge_jumpdests(assembly):
                 for j in range(len(assembly)):
                     if assembly[j] == current_symbol and i != j:
                         assembly[j] = new_symbol
+                        changed = True
 
         i += 1
 
+    return changed
+
 
 def _merge_iszero(assembly):
+    changed = False
+
     i = 0
     while i < len(assembly) - 2:
         if assembly[i : i + 3] == ["ISZERO", "ISZERO", "ISZERO"]:
+            changed = True
             del assembly[i : i + 2]
         else:
             i += 1
@@ -930,12 +843,17 @@ def _merge_iszero(assembly):
             and is_symbol(assembly[i + 2])
             and assembly[i + 3] == "JUMPI"
         ):
+            changed = True
             del assembly[i : i + 2]
         else:
             i += 1
 
+    return changed
+
 
 def _prune_unused_jumpdests(assembly):
+    changed = False
+
     used_jumpdests = set()
 
     # find all used jumpdests
@@ -947,27 +865,35 @@ def _prune_unused_jumpdests(assembly):
     i = 0
     while i < len(assembly) - 2:
         if is_symbol(assembly[i]) and assembly[i] not in used_jumpdests:
+            changed = True
             del assembly[i : i + 2]
         else:
             i += 1
 
+    return changed
+
 
 def _stack_peephole_opts(assembly):
+    changed = False
     i = 0
     while i < len(assembly) - 2:
         # usually generated by with statements that return their input like
         # (with x (...x))
         if assembly[i : i + 3] == ["DUP1", "SWAP1", "POP"]:
             # DUP1 SWAP1 POP == no-op
+            changed = True
             del assembly[i : i + 3]
             continue
         # usually generated by nested with statements that don't return like
         # (with x (with y ...))
         if assembly[i : i + 3] == ["SWAP1", "POP", "POP"]:
             # SWAP1 POP POP == POP POP
+            changed = True
             del assembly[i]
             continue
         i += 1
+
+    return changed
 
 
 # optimize assembly, in place
@@ -976,16 +902,24 @@ def _optimize_assembly(assembly):
         if isinstance(x, list):
             _optimize_assembly(x)
 
-    _prune_unreachable_code(assembly)
-    _merge_iszero(assembly)
-    _merge_jumpdests(assembly)
-    _prune_inefficient_jumps(assembly)
-    _prune_unused_jumpdests(assembly)
-    _stack_peephole_opts(assembly)
+    for _ in range(1024):
+        changed = False
+
+        changed |= _prune_unreachable_code(assembly)
+        changed |= _merge_iszero(assembly)
+        changed |= _merge_jumpdests(assembly)
+        changed |= _prune_inefficient_jumps(assembly)
+        changed |= _prune_unused_jumpdests(assembly)
+        changed |= _stack_peephole_opts(assembly)
+
+        if not changed:
+            return
+
+    raise CompilerPanic("infinite loop detected during assembly reduction")  # pragma: notest
 
 
 # Assembles assembly into EVM
-def assembly_to_evm(assembly, start_pos=0):
+def assembly_to_evm(assembly, start_pos=0, insert_vyper_signature=False):
     line_number_map = {
         "breakpoints": set(),
         "pc_breakpoints": set(),
@@ -996,6 +930,11 @@ def assembly_to_evm(assembly, start_pos=0):
     posmap = {}
     runtime_code, runtime_code_start, runtime_code_end = None, None, None
     pos = start_pos
+
+    bytecode_suffix = b""
+    if insert_vyper_signature:
+        # CBOR encoded: {"vyper": [major,minor,patch]}
+        bytecode_suffix += b"\xa1\x65vyper\x83" + bytes(list(version_tuple))
 
     # go through the code, resolving symbolic locations
     # (i.e. JUMPDEST locations) to actual code locations
@@ -1044,7 +983,10 @@ def assembly_to_evm(assembly, start_pos=0):
             pos += 0
         elif isinstance(item, list):
             assert runtime_code is None, "Multiple subcodes"
-            runtime_code, sub_map = assembly_to_evm(item, start_pos=pos)
+            runtime_code, sub_map = assembly_to_evm(
+                item, start_pos=pos, insert_vyper_signature=True
+            )
+
             assert item[0].startswith("_DEPLOY_MEM_OFST_")
             ctor_mem_size = int(item[0][len("_DEPLOY_MEM_OFST_") :])
 
@@ -1057,6 +999,8 @@ def assembly_to_evm(assembly, start_pos=0):
                 line_number_map[key].update(sub_map[key])
         else:
             pos += 1
+
+    pos += len(bytecode_suffix)
 
     code_end = pos - start_pos
     posmap["_sym_code_end"] = code_end
@@ -1111,6 +1055,8 @@ def assembly_to_evm(assembly, start_pos=0):
         else:
             # Should never reach because, assembly is create in _compile_to_assembly.
             raise Exception("Weird symbol in assembly: " + str(item))  # pragma: no cover
+
+    o += bytecode_suffix
 
     assert len(o) == pos - start_pos, (len(o), pos, start_pos)
     line_number_map["breakpoints"] = list(line_number_map["breakpoints"])

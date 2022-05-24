@@ -5,16 +5,10 @@ import random
 import pytest
 
 from vyper.codegen.types.types import INTEGER_TYPES, parse_integer_typeinfo
-from vyper.utils import evm_div, int_bounds
+from vyper.utils import evm_div, int_bounds, unsigned_to_signed
 
 # TODO something less janky
 integer_types = sorted(list(INTEGER_TYPES))
-
-
-def _as_signed(x, bits):
-    if x > (2 ** (bits - 1)) - 1:
-        return x - 2 ** bits
-    return x
 
 
 @pytest.mark.parametrize("typ", integer_types)
@@ -33,10 +27,9 @@ def foo(x: {typ}, y: {typ}) -> {typ}:
     c = get_contract(code)
 
     lo, hi = int_bounds(int_info.is_signed, int_info.bits)
-    # number of cases very much affects fuzzer time so test u/int256
-    # with more cases, and fewer cases for all other int types
-    # (roughly 5k cases total generated)
-    NUM_CASES = 40 if typ in ("int256", "uint256") else 5
+    # (roughly 8k cases total generated)
+    # TODO refactor to use fixtures
+    NUM_CASES = 15
     xs = [random.randrange(lo, hi) for _ in range(NUM_CASES)]
     ys = [random.randrange(lo, hi) for _ in range(NUM_CASES)]
 
@@ -48,7 +41,8 @@ def foo(x: {typ}, y: {typ}) -> {typ}:
         xs += [lo, lo + 1, -1, 0, 1, hi - 1, hi]
         ys += [lo, lo + 1, -1, 0, 1, hi - 1, hi]
         for (x, y) in itertools.product(xs, ys):
-            expected = _as_signed(fn(x, y) % mod_bound, int_info.bits)
+            expected = unsigned_to_signed(fn(x, y) % mod_bound, int_info.bits)
+
             assert c.foo(x, y) == expected
     else:
         # 0x80 has some weird properties, like

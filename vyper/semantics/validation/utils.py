@@ -27,6 +27,7 @@ from vyper.semantics.types.indexable.sequence import (
 )
 from vyper.semantics.types.value.array_value import BytesArrayDefinition, StringDefinition
 from vyper.semantics.types.value.boolean import BoolDefinition
+from vyper.semantics.validation.levenshtein_utils import get_levenshtein_error_suggestions
 
 
 def _validate_op(node, types_list, validation_fn_name):
@@ -151,8 +152,11 @@ class _ExprTypeChecker:
                     f"'{name}' is not a storage variable, it should not be prepended with self",
                     node,
                 ) from None
+
+            suggestions_str = get_levenshtein_error_suggestions(name, var.members, 0.4)
             raise UndeclaredDefinition(
-                f"Storage variable '{name}' has not been declared", node
+                f"Storage variable '{name}' has not been declared. {suggestions_str}",
+                node,
             ) from None
 
     def types_from_BinOp(self, node):
@@ -270,10 +274,15 @@ class _ExprTypeChecker:
         # index access, e.g. `foo[1]`
         if isinstance(node.value, vy_ast.List):
             types_list = self.get_possible_types_from_node(node.value)
-            return [base_type.get_index_type(node.slice.value) for base_type in types_list]
+            ret = []
+            for t in types_list:
+                t.validate_index_type(node.slice.value)
+                ret.append(t.get_subscripted_type(node.slice.value))
+            return ret
 
-        base_type = self.get_exact_type_from_node(node.value)
-        return [base_type.get_index_type(node.slice.value)]
+        t = self.get_exact_type_from_node(node.value)
+        t.validate_index_type(node.slice.value)
+        return [t.get_subscripted_type(node.slice.value)]
 
     def types_from_Tuple(self, node):
         types_list = [self.get_exact_type_from_node(i) for i in node.elements]

@@ -1,6 +1,7 @@
+import re
 import warnings
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from vyper import ast as vy_ast
 from vyper.ast.validation import validate_call_args
@@ -16,7 +17,7 @@ from vyper.exceptions import (
 )
 from vyper.semantics.namespace import get_namespace
 from vyper.semantics.types.bases import BaseTypeDefinition, DataLocation, StorageSlot
-from vyper.semantics.types.indexable.sequence import DynamicArrayDefinition, TupleDefinition
+from vyper.semantics.types.indexable.sequence import TupleDefinition
 from vyper.semantics.types.utils import (
     StringEnum,
     check_kwargable,
@@ -121,8 +122,12 @@ class ContractFunction(BaseTypeDefinition):
         self.mutability = state_mutability
         self.nonreentrant = nonreentrant
 
+        # a list of internal functions this function calls
+        self.called_functions: Set["ContractFunction"] = set()
+
     def __repr__(self):
-        return f"contract function '{self.name}'"
+        arg_types = ",".join(repr(a) for a in self.arguments.values())
+        return f"contract function {self.name}({arg_types})"
 
     @classmethod
     def from_abi(cls, abi: Dict) -> "ContractFunction":
@@ -306,7 +311,7 @@ class ContractFunction(BaseTypeDefinition):
 
         namespace = get_namespace()
         for arg, value in zip(node.args.args, defaults):
-            if arg.arg in ("gas", "value", "skip_contract_check"):
+            if arg.arg in ("gas", "value", "skip_contract_check", "default_return_value"):
                 raise ArgumentException(
                     f"Cannot use '{arg.arg}' as a variable name in a function input",
                     arg,
@@ -336,6 +341,10 @@ class ContractFunction(BaseTypeDefinition):
         # return types
         if node.returns is None:
             return_type = None
+        elif node.name == "__init__":
+            raise FunctionDeclarationException(
+                "Constructor may not have a return type", node.returns
+            )
         elif isinstance(node.returns, (vy_ast.Name, vy_ast.Call, vy_ast.Subscript)):
             return_type = get_type_from_annotation(node.returns, location=DataLocation.MEMORY)
         elif isinstance(node.returns, vy_ast.Tuple):
@@ -352,7 +361,7 @@ class ContractFunction(BaseTypeDefinition):
         if hasattr(self, "reentrancy_key_position"):
             raise CompilerPanic("Position was already assigned")
         if self.nonreentrant is None:
-            raise CompilerPanic("No reentrant key {self}")
+            raise CompilerPanic(f"No reentrant key {self}")
         # sanity check even though implied by the type
         if position._location != DataLocation.STORAGE:
             raise CompilerPanic("Non-storage reentrant key")
@@ -390,6 +399,14 @@ class ContractFunction(BaseTypeDefinition):
             function_visibility=FunctionVisibility.EXTERNAL,
             state_mutability=StateMutability.VIEW,
         )
+
+    @property
+    def is_external(self) -> bool:
+        return self.visibility == FunctionVisibility.EXTERNAL
+
+    @property
+    def is_internal(self) -> bool:
+        return self.visibility == FunctionVisibility.INTERNAL
 
     @property
     def method_ids(self) -> Dict[str, int]:
@@ -441,18 +458,18 @@ class ContractFunction(BaseTypeDefinition):
 
     def fetch_call_return(self, node: vy_ast.Call) -> Optional[BaseTypeDefinition]:
         if node.get("func.value.id") == "self" and self.visibility == FunctionVisibility.EXTERNAL:
-            raise CallViolation("Cannnot call external functions via 'self'", node)
+            raise CallViolation("Cannot call external functions via 'self'", node)
 
         # for external calls, include gas and value as optional kwargs
         kwarg_keys = self.kwarg_keys.copy()
         if node.get("func.value.id") != "self":
-            kwarg_keys += ["gas", "value", "skip_contract_check"]
+            kwarg_keys += ["gas", "value", "skip_contract_check", "default_return_value"]
         validate_call_args(node, (self.min_arg_count, self.max_arg_count), kwarg_keys)
 
         if self.mutability < StateMutability.PAYABLE:
             kwarg_node = next((k for k in node.keywords if k.arg == "value"), None)
             if kwarg_node is not None:
-                raise CallViolation("Cannnot send ether to nonpayable function", kwarg_node)
+                raise CallViolation("Cannot send ether to nonpayable function", kwarg_node)
 
         for arg, expected in zip(node.args, self.arguments.values()):
             validate_expected_type(arg, expected)
@@ -460,12 +477,32 @@ class ContractFunction(BaseTypeDefinition):
         for kwarg in node.keywords:
             if kwarg.arg in ("gas", "value"):
                 validate_expected_type(kwarg.value, Uint256Definition())
-            elif kwarg.arg in ("skip_contract_check"):
+            elif kwarg.arg in ("skip_contract_check",):
                 validate_expected_type(kwarg.value, BoolDefinition())
                 if not isinstance(kwarg.value, vy_ast.NameConstant):
                     raise InvalidType("skip_contract_check must be literal bool", kwarg.value)
+            elif kwarg.arg in ("default_return_value",):
+                validate_expected_type(kwarg.value, self.return_type)
             else:
-                validate_expected_type(kwarg.arg, kwarg.value)
+                # Generate the modified source code string with the kwarg removed
+                # as a suggestion to the user.
+                kwarg_pattern = fr"{kwarg.arg}\s*=\s*{re.escape(kwarg.value.node_source_code)}"
+                modified_line = re.sub(
+                    kwarg_pattern, kwarg.value.node_source_code, node.node_source_code
+                )
+                error_suggestion = (
+                    f"\n(hint: Try removing the kwarg: `{modified_line}`)"
+                    if modified_line != node.node_source_code
+                    else ""
+                )
+
+                raise ArgumentException(
+                    (
+                        "Usage of kwarg in Vyper is restricted to gas=, "
+                        f"value= and skip_contract_check=. {error_suggestion}"
+                    ),
+                    kwarg,
+                )
 
         return self.return_type
 
@@ -508,34 +545,45 @@ class MemberFunctionDefinition(BaseTypeDefinition):
     Member function type definition.
 
     This class has no corresponding primitive.
+
+    (examples for (x <DynArray[int128, 3]>).append(1))
+
+    Arguments:
+        underlying_type: the type this method is attached to. ex. DynArray[int128, 3]
+        name: the name of this method. ex. "append"
+        arg_types: the argument types this method accepts. ex. [int128]
+        return_type: the return type of this method. ex. None
     """
 
     _is_callable = True
 
     def __init__(
-        self, underlying_type: BaseTypeDefinition, name: str, min_arg_count: int, max_arg_count: int
+        self,
+        underlying_type: BaseTypeDefinition,
+        name: str,
+        arg_types: List[BaseTypeDefinition],
+        return_type: Optional[BaseTypeDefinition],
+        is_modifying: bool,
     ) -> None:
         super().__init__(DataLocation.UNSET)
         self.underlying_type = underlying_type
         self.name = name
-        self.min_arg_count = min_arg_count
-        self.max_arg_count = max_arg_count
+        self.arg_types = arg_types
+        self.return_type = return_type
+        self.is_modifying = is_modifying
 
     def __repr__(self):
         return f"{self.underlying_type._id} member function '{self.name}'"
 
     def fetch_call_return(self, node: vy_ast.Call) -> Optional[BaseTypeDefinition]:
-        validate_call_args(node, (self.min_arg_count, self.max_arg_count))
+        validate_call_args(node, len(self.arg_types))
 
-        if isinstance(self.underlying_type, DynamicArrayDefinition):
-            if self.name == "append":
-                return None
+        assert len(node.args) == len(self.arg_types)  # validate_call_args postcondition
+        for arg, expected_type in zip(node.args, self.arg_types):
+            # CMC 2022-04-01 this should probably be in the validation module
+            validate_expected_type(arg, expected_type)
 
-            elif self.name == "pop":
-                value_type = self.underlying_type.value_type
-                return value_type
-
-        raise CallViolation("Function does not exist on given type", node)
+        return self.return_type
 
 
 def _generate_method_id(name: str, canonical_abi_types: List[str]) -> Dict[str, int]:

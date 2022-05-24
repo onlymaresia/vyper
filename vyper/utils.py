@@ -2,9 +2,21 @@ import binascii
 import decimal
 import sys
 import traceback
-from typing import Dict, List, Union
+from typing import List, Union
 
-from vyper.exceptions import InvalidLiteral
+from vyper.exceptions import DecimalOverrideException, InvalidLiteral
+
+
+class DecimalContextOverride(decimal.Context):
+    def __setattr__(self, name, value):
+        if name == "prec":
+            # CMC 2022-03-27: should we raise a warning instead of an exception?
+            raise DecimalOverrideException("Overriding decimal precision disabled")
+        super().__setattr__(name, value)
+
+
+decimal.setcontext(DecimalContextOverride(prec=78))
+
 
 try:
     from Crypto.Hash import keccak  # type: ignore
@@ -27,12 +39,59 @@ def fourbytes_to_int(inp):
     return (inp[0] << 24) + (inp[1] << 16) + (inp[2] << 8) + inp[3]
 
 
+def signed_to_unsigned(int_, bits, strict=False):
+    """
+    Reinterpret a signed integer with n bits as an unsigned integer.
+    The implementation is unforgiving in that it assumes the input is in
+    bounds for int<bits>, in order to fail more loudly (and not hide
+    errors in modular reasoning in consumers of this function).
+    """
+    if strict:
+        lo, hi = int_bounds(signed=True, bits=bits)
+        assert lo <= int_ <= hi
+    if int_ < 0:
+        return int_ + 2 ** bits
+    return int_
+
+
+def unsigned_to_signed(int_, bits, strict=False):
+    """
+    Reinterpret an unsigned integer with n bits as a signed integer.
+    The implementation is unforgiving in that it assumes the input is in
+    bounds for uint<bits>, in order to fail more loudly (and not hide
+    errors in modular reasoning in consumers of this function).
+    """
+    if strict:
+        lo, hi = int_bounds(signed=False, bits=bits)
+        assert lo <= int_ <= hi
+    if int_ > (2 ** (bits - 1)) - 1:
+        return int_ - (2 ** bits)
+    return int_
+
+
+def is_power_of_two(n: int) -> bool:
+    # busted for ints wider than 53 bits:
+    # t = math.log(n, 2)
+    # return math.ceil(t) == math.floor(t)
+    return n != 0 and ((n & (n - 1)) == 0)
+
+
+# https://stackoverflow.com/a/71122440/
+def int_log2(n: int) -> int:
+    return n.bit_length() - 1
+
+
 # utility function for debugging purposes
 def trace(n=5, out=sys.stderr):
     print("BEGIN TRACE", file=out)
     for x in list(traceback.format_stack())[-n:]:
         print(x.strip(), file=out)
     print("END TRACE", file=out)
+
+
+# print a warning
+def vyper_warn(msg, prefix="Warning: ", file_=sys.stderr):
+    print(f"{prefix}{msg}", file=file_)
 
 
 # converts a signature like Func(bool,uint256,address) to its 4 byte method ID
@@ -44,6 +103,13 @@ def abi_method_id(method_sig):
 # map a string to only-alphanumeric chars
 def mkalphanum(s):
     return "".join([c if c.isalnum() else "_" for c in s])
+
+
+def round_towards_zero(d: decimal.Decimal) -> int:
+    # TODO double check if this can just be int(d)
+    # (but either way keep this util function bc it's easier at a glance
+    # to understand what round_towards_zero() does instead of int())
+    return int(d.to_integral_exact(decimal.ROUND_DOWN))
 
 
 # Converts string to bytes
@@ -70,6 +136,10 @@ def bytes_to_int(bytez):
     for b in bytez:
         o = o * 256 + b
     return o
+
+
+def is_checksum_encoded(addr):
+    return addr == checksum_encode(addr)
 
 
 # Encodes an address using ethereum's checksum scheme
@@ -117,12 +187,17 @@ def int_bounds(signed, bits):
     return 0, (2 ** bits) - 1
 
 
+# e.g. -1 -> -(2**256 - 1)
+def evm_twos_complement(x: int) -> int:
+    # return ((o + 2 ** 255) % 2 ** 256) - 2 ** 255
+    return ((2 ** 256 - 1) ^ x) + 1
+
+
 # EVM div semantics as a python function
 def evm_div(x, y):
     if y == 0:
         return 0
-    # doesn't actually work:
-    # return int(x / y)
+    # NOTE: should be same as: round_towards_zero(Decimal(x)/Decimal(y))
     sign = -1 if (x * y) < 0 else 1
     return sign * (abs(x) // abs(y))  # adapted from py-evm
 
@@ -132,19 +207,15 @@ def evm_mod(x, y):
     if y == 0:
         return 0
 
-    # this doesn't actually work when num digits exceeds fp precision:
-    # return int(math.fmod(x, y))
     sign = -1 if x < 0 else 1
     return sign * (abs(x) % abs(y))  # adapted from py-evm
 
 
 # memory used for system purposes, not for variables
 class MemoryPositions:
-    MAXDECIMAL = 32
-    MINDECIMAL = 64
-    FREE_VAR_SPACE = 128
-    FREE_VAR_SPACE2 = 160
-    RESERVED_MEMORY = 192
+    FREE_VAR_SPACE = 0
+    FREE_VAR_SPACE2 = 32
+    RESERVED_MEMORY = 64
 
 
 # Sizes of different data types. Used to clamp types.
@@ -153,31 +224,28 @@ class SizeLimits:
     MIN_INT128 = -(2 ** 127)
     MAX_INT256 = 2 ** 255 - 1
     MIN_INT256 = -(2 ** 255)
-    MAXDECIMAL = (2 ** 127 - 1) * DECIMAL_DIVISOR
-    MINDECIMAL = (-(2 ** 127)) * DECIMAL_DIVISOR
+    MAXDECIMAL = 2 ** 167 - 1  # maxdecimal as EVM value
+    MINDECIMAL = -(2 ** 167)  # mindecimal as EVM value
+    # min decimal allowed as Python value
+    MIN_AST_DECIMAL = -decimal.Decimal(2 ** 167) / DECIMAL_DIVISOR
+    # max decimal allowed as Python value
+    MAX_AST_DECIMAL = decimal.Decimal(2 ** 167 - 1) / DECIMAL_DIVISOR
     MAX_UINT8 = 2 ** 8 - 1
     MAX_UINT256 = 2 ** 256 - 1
 
     @classmethod
     def in_bounds(cls, type_str, value):
         # TODO: fix this circular import
-        from vyper.codegen.types import parse_integer_typeinfo
+        from vyper.codegen.types import parse_decimal_info, parse_integer_typeinfo
 
         assert isinstance(type_str, str)
         if type_str == "decimal":
-            return decimal.Decimal(cls.MINDECIMAL) <= value <= decimal.Decimal(cls.MAXDECIMAL)
+            info = parse_decimal_info(type_str)
+        else:
+            info = parse_integer_typeinfo(type_str)
 
-        int_info = parse_integer_typeinfo(type_str)
-        (lo, hi) = int_bounds(int_info.is_signed, int_info.bits)
+        (lo, hi) = int_bounds(info.is_signed, info.bits)
         return lo <= value <= hi
-
-
-# Map representing all limits loaded into a contract as part of the initializer
-# code.
-LOADED_LIMITS: Dict[int, int] = {
-    MemoryPositions.MAXDECIMAL: SizeLimits.MAXDECIMAL,
-    MemoryPositions.MINDECIMAL: SizeLimits.MINDECIMAL,
-}
 
 
 # Otherwise reserved words that are whitelisted for function declarations
@@ -185,9 +253,9 @@ FUNCTION_WHITELIST = {
     "send",
 }
 
-# List of valid LLL macros.
-# TODO move this somewhere else, like lll_node.py
-VALID_LLL_MACROS = {
+# List of valid IR macros.
+# TODO move this somewhere else, like ir_node.py
+VALID_IR_MACROS = {
     "assert",
     "break",
     "iload",
@@ -195,19 +263,13 @@ VALID_LLL_MACROS = {
     "dload",
     "dloadbytes",
     "ceil32",
-    "clamp",
-    "clamp_nonzero",
-    "clampge",
-    "clampgt",
-    "clample",
-    "clamplt",
     "continue",
     "debugger",
     "ge",
     "if",
     "select",
     "le",
-    "lll",
+    "deploy",
     "ne",
     "pass",
     "repeat",
@@ -217,11 +279,6 @@ VALID_LLL_MACROS = {
     "sha3_32",
     "sha3_64",
     "sle",
-    "uclamp",
-    "uclampge",
-    "uclampgt",
-    "uclample",
-    "uclamplt",
     "with",
     "label",
     "goto",

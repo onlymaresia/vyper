@@ -14,7 +14,6 @@ from vyper.exceptions import (
     NonPayableViolation,
     StateAccessViolation,
     StructureException,
-    SyntaxException,
     TypeMismatch,
     VariableDeclarationException,
     VyperException,
@@ -30,6 +29,7 @@ from vyper.semantics.types.function import (
     MemberFunctionDefinition,
     StateMutability,
 )
+from vyper.semantics.types.indexable.mapping import MappingDefinition
 from vyper.semantics.types.indexable.sequence import (
     ArrayDefinition,
     DynamicArrayDefinition,
@@ -88,7 +88,7 @@ def check_for_terminus(node_list: list) -> bool:
     return False
 
 
-def _check_iterator_assign(
+def _check_iterator_modification(
     target_node: vy_ast.VyperNode, search_node: vy_ast.VyperNode
 ) -> Optional[vy_ast.VyperNode]:
     similar_nodes = [
@@ -100,7 +100,19 @@ def _check_iterator_assign(
     for node in similar_nodes:
         # raise if the node is the target of an assignment statement
         assign_node = node.get_ancestor((vy_ast.Assign, vy_ast.AugAssign))
+        # note the use of get_descendants() blocks statements like
+        # self.my_array[i] = x
         if assign_node and node in assign_node.target.get_descendants(include_self=True):
+            return node
+
+        attr_node = node.get_ancestor(vy_ast.Attribute)
+        # note the use of get_descendants() blocks statements like
+        # self.my_array[i].append(x)
+        if (
+            attr_node is not None
+            and node in attr_node.value.get_descendants(include_self=True)
+            and attr_node.attr in ("append", "pop", "extend")
+        ):
             return node
 
     return None
@@ -128,24 +140,27 @@ def _validate_address_code_attribute(node: vy_ast.Attribute) -> None:
             ok_args = len(parent.args) == 3 and isinstance(parent.args[2], vy_ast.Int)
             if ok_func and ok_args:
                 return
-        raise SyntaxException(
+        raise StructureException(
             "(address).code is only allowed inside of a slice function with a constant length",
-            node.node_source_code,
-            node.lineno,  # type: ignore[attr-defined]
-            node.col_offset,  # type: ignore[attr-defined]
+            node,
         )
 
 
 def _validate_msg_data_attribute(node: vy_ast.Attribute) -> None:
     if isinstance(node.value, vy_ast.Name) and node.value.id == "msg" and node.attr == "data":
         parent = node.get_ancestor()
-        if parent.get("func.id") not in ("slice", "len"):
-            raise SyntaxException(
+        if not isinstance(parent, vy_ast.Call) or parent.get("func.id") not in ("slice", "len"):
+            raise StructureException(
                 "msg.data is only allowed inside of the slice or len functions",
-                node.node_source_code,
-                node.lineno,  # type: ignore[attr-defined]
-                node.col_offset,  # type: ignore[attr-defined]
+                node,
             )
+        if parent.get("func.id") == "slice":
+            ok_args = len(parent.args) == 3 and isinstance(parent.args[2], vy_ast.Int)
+            if not ok_args:
+                raise StructureException(
+                    "slice(msg.data) must use a compile-time constant for length argument",
+                    parent,
+                )
 
 
 class FunctionNodeVisitor(VyperNodeVisitorBase):
@@ -153,7 +168,6 @@ class FunctionNodeVisitor(VyperNodeVisitorBase):
     ignored_types = (
         vy_ast.Break,
         vy_ast.Constant,
-        vy_ast.Continue,
         vy_ast.Pass,
     )
     scope_name = "function"
@@ -227,25 +241,27 @@ class FunctionNodeVisitor(VyperNodeVisitorBase):
     def visit_Assign(self, node):
         if isinstance(node.value, vy_ast.Tuple):
             raise StructureException("Right-hand side of assignment cannot be a tuple", node.value)
+
         target = get_exact_type_from_node(node.target)
-        validate_expected_type(node.value, target)
-        if self.func.mutability <= StateMutability.VIEW and target.location == DataLocation.STORAGE:
-            raise StateAccessViolation(
-                f"Cannot modify storage in a {self.func.mutability.value} function", node
+        if isinstance(target, MappingDefinition):
+            raise StructureException(
+                "Left-hand side of assignment cannot be a HashMap without a key", node
             )
-        target.validate_modification(node)
+
+        validate_expected_type(node.value, target)
+        target.validate_modification(node, self.func.mutability)
+
         self.expr_visitor.visit(node.value)
 
     def visit_AugAssign(self, node):
         if isinstance(node.value, vy_ast.Tuple):
             raise StructureException("Right-hand side of assignment cannot be a tuple", node.value)
+
         target = get_exact_type_from_node(node.target)
+
         validate_expected_type(node.value, target)
-        if self.func.mutability <= StateMutability.VIEW and target.location == DataLocation.STORAGE:
-            raise StateAccessViolation(
-                f"Cannot modify storage in a {self.func.mutability.value} function", node
-            )
-        target.validate_modification(node)
+        target.validate_modification(node, self.func.mutability)
+
         self.expr_visitor.visit(node.value)
 
     def visit_Raise(self, node):
@@ -263,6 +279,11 @@ class FunctionNodeVisitor(VyperNodeVisitorBase):
         except InvalidType:
             raise InvalidType("Assertion test value must be a boolean", node.test)
         self.expr_visitor.visit(node.test)
+
+    def visit_Continue(self, node):
+        for_node = node.get_ancestor(vy_ast.For)
+        if for_node is None:
+            raise StructureException("`continue` must be enclosed in a `for` loop", node)
 
     def visit_Return(self, node):
         values = node.value
@@ -365,7 +386,7 @@ class FunctionNodeVisitor(VyperNodeVisitorBase):
 
         if isinstance(node.iter, (vy_ast.Name, vy_ast.Attribute)):
             # check for references to the iterated value within the body of the loop
-            assign = _check_iterator_assign(node.iter, node)
+            assign = _check_iterator_modification(node.iter, node)
             if assign:
                 raise ImmutableViolation("Cannot modify array during iteration", assign)
 
@@ -376,7 +397,7 @@ class FunctionNodeVisitor(VyperNodeVisitorBase):
                 fn_name = call_node.func.attr
 
                 fn_node = self.vyper_module.get_children(vy_ast.FunctionDef, {"name": fn_name})[0]
-                if _check_iterator_assign(node.iter, fn_node):
+                if _check_iterator_modification(node.iter, fn_node):
                     # check for direct modification
                     raise ImmutableViolation(
                         f"Cannot call '{fn_name}' inside for loop, it potentially "
@@ -387,7 +408,7 @@ class FunctionNodeVisitor(VyperNodeVisitorBase):
                 for name in self.namespace["self"].members[fn_name].recursive_calls:
                     # check for indirect modification
                     fn_node = self.vyper_module.get_children(vy_ast.FunctionDef, {"name": name})[0]
-                    if _check_iterator_assign(node.iter, fn_node):
+                    if _check_iterator_modification(node.iter, fn_node):
                         raise ImmutableViolation(
                             f"Cannot call '{fn_name}' inside for loop, it may call to '{name}' "
                             f"which potentially modifies iterated storage variable '{iter_name}'",
@@ -439,6 +460,7 @@ class FunctionNodeVisitor(VyperNodeVisitorBase):
     def visit_Expr(self, node):
         if not isinstance(node.value, vy_ast.Call):
             raise StructureException("Expressions without assignment are disallowed", node)
+
         fn_type = get_exact_type_from_node(node.value.func)
         if isinstance(fn_type, Event):
             raise StructureException("To call an event you must use the `log` statement", node)
@@ -457,6 +479,11 @@ class FunctionNodeVisitor(VyperNodeVisitorBase):
                 raise StateAccessViolation(
                     f"Cannot call any function from a {self.func.mutability.value} function", node
                 )
+
+        if isinstance(fn_type, MemberFunctionDefinition) and fn_type.is_modifying:
+            fn_type.underlying_type.validate_modification(node, self.func.mutability)
+
+        # NOTE: fetch_call_return validates call args.
         return_value = fn_type.fetch_call_return(node.value)
         if (
             return_value

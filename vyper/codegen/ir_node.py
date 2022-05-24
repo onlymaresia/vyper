@@ -2,13 +2,14 @@ import re
 from enum import Enum, auto
 from typing import Any, List, Optional, Tuple, Union
 
+from vyper.address_space import AddrSpace
 from vyper.codegen.types import BaseType, NodeType, ceil32
 from vyper.compiler.settings import VYPER_COLOR_OUTPUT
-from vyper.evm.opcodes import get_lll_opcodes
+from vyper.evm.opcodes import get_ir_opcodes
 from vyper.exceptions import CodegenPanic, CompilerPanic
-from vyper.utils import VALID_LLL_MACROS, cached_property
+from vyper.utils import VALID_IR_MACROS, cached_property
 
-# Set default string representation for ints in LLL output.
+# Set default string representation for ints in IR output.
 AS_HEX_DEFAULT = False
 
 if VYPER_COLOR_OUTPUT:
@@ -46,30 +47,27 @@ class Encoding(Enum):
     VYPER = auto()
     # abi encoded, default for args/return values from external funcs
     ABI = auto()
-    # abi encoded, same as ABI but no clamps for bytestrings
-    JSON_ABI = auto()
     # future: packed
 
 
-# Data structure for LLL parse tree
-class LLLnode:
+# Data structure for IR parse tree
+class IRnode:
     repr_show_gas = False
-    gas: int
+    _gas: int
     valency: int
-    args: List["LLLnode"]
+    args: List["IRnode"]
     value: Union[str, int]
 
     def __init__(
         self,
         value: Union[str, int],
-        args: List["LLLnode"] = None,
+        args: List["IRnode"] = None,
         typ: NodeType = None,
-        location: str = None,
-        pos: Optional[Tuple[int, int]] = None,
+        location: Optional[AddrSpace] = None,
+        source_pos: Optional[Tuple[int, int]] = None,
         annotation: Optional[str] = None,
         mutable: bool = True,
         add_gas_estimate: int = 0,
-        valency: Optional[int] = None,
         encoding: Encoding = Encoding.VYPER,
     ):
         if args is None:
@@ -81,22 +79,18 @@ class LLLnode:
         assert isinstance(typ, NodeType) or typ is None, repr(typ)
         self.typ = typ
         self.location = location
-        self.pos = pos
+        self.source_pos = source_pos
         self.annotation = annotation
         self.mutable = mutable
         self.add_gas_estimate = add_gas_estimate
         self.encoding = encoding
         self.as_hex = AS_HEX_DEFAULT
 
-        # Optional annotation properties for gas estimation
-        self.total_gas = None
-        self.func_name = None
-
         def _check(condition, err):
             if not condition:
                 raise CompilerPanic(str(err))
 
-        _check(self.value is not None, "None is not allowed as LLLnode value")
+        _check(self.value is not None, "None is not allowed as IRnode value")
 
         # Determine this node's valency (1 if it pushes a value on the stack,
         # 0 otherwise) and checks to make sure the number and valencies of
@@ -104,12 +98,16 @@ class LLLnode:
         # Numbers
         if isinstance(self.value, int):
             _check(len(self.args) == 0, "int can't have arguments")
+
+            # integers must be in the range (MIN_INT256, MAX_UINT256)
+            _check(-(2 ** 255) <= self.value < 2 ** 256, "out of range")
+
             self.valency = 1
-            self.gas = 5
+            self._gas = 5
         elif isinstance(self.value, str):
             # Opcodes and pseudo-opcodes (e.g. clamp)
-            if self.value.upper() in get_lll_opcodes():
-                _, ins, outs, gas = get_lll_opcodes()[self.value.upper()]
+            if self.value.upper() in get_ir_opcodes():
+                _, ins, outs, gas = get_ir_opcodes()[self.value.upper()]
                 self.valency = outs
                 _check(
                     len(self.args) == ins,
@@ -117,7 +115,7 @@ class LLLnode:
                 )
                 # We add 2 per stack height at push time and take it back
                 # at pop time; this makes `break` easier to handle
-                self.gas = gas + 2 * (outs - ins)
+                self._gas = gas + 2 * (outs - ins)
                 for arg in self.args:
                     # pop and pass are used to push/pop values on the stack to be
                     # consumed for internal functions, therefore we whitelist this as a zero valency
@@ -127,16 +125,16 @@ class LLLnode:
                         arg.valency == 1 or arg.value in zero_valency_whitelist,
                         f"invalid argument to `{self.value}`: {arg}",
                     )
-                    self.gas += arg.gas
+                    self._gas += arg.gas
                 # Dynamic gas cost: 8 gas for each byte of logging data
                 if self.value.upper()[0:3] == "LOG" and isinstance(self.args[1].value, int):
-                    self.gas += self.args[1].value * 8
+                    self._gas += self.args[1].value * 8
                 # Dynamic gas cost: non-zero-valued call
                 if self.value.upper() == "CALL" and self.args[2].value != 0:
-                    self.gas += 34000
+                    self._gas += 34000
                 # Dynamic gas cost: filling sstore (ie. not clearing)
                 elif self.value.upper() == "SSTORE" and self.args[1].value != 0:
-                    self.gas += 15000
+                    self._gas += 15000
                 # Dynamic gas cost: calldatacopy
                 elif self.value.upper() in ("CALLDATACOPY", "CODECOPY", "EXTCODECOPY"):
                     size = 34000
@@ -144,16 +142,16 @@ class LLLnode:
                     size_arg = self.args[size_arg_index]
                     if isinstance(size_arg.value, int):
                         size = size_arg.value
-                    self.gas += ceil32(size) // 32 * 3
+                    self._gas += ceil32(size) // 32 * 3
                 # Gas limits in call
                 if self.value.upper() == "CALL" and isinstance(self.args[0].value, int):
-                    self.gas += self.args[0].value
+                    self._gas += self.args[0].value
             # If statements
             elif self.value == "if":
                 if len(self.args) == 3:
-                    self.gas = self.args[0].gas + max(self.args[1].gas, self.args[2].gas) + 3
+                    self._gas = self.args[0].gas + max(self.args[1].gas, self.args[2].gas) + 3
                 if len(self.args) == 2:
-                    self.gas = self.args[0].gas + self.args[1].gas + 17
+                    self._gas = self.args[0].gas + self.args[1].gas + 17
                 _check(
                     self.args[0].valency > 0,
                     f"zerovalent argument as a test to an if statement: {self.args[0]}",
@@ -172,7 +170,7 @@ class LLLnode:
                     f"zerovalent argument to with statement: {self.args[1]}",
                 )
                 self.valency = self.args[2].valency
-                self.gas = sum([arg.gas for arg in self.args]) + 5
+                self._gas = sum([arg.gas for arg in self.args]) + 5
             # Repeat statements: repeat <index_name> <startval> <rounds> <rounds_bound> <body>
             elif self.value == "repeat":
                 _check(
@@ -195,19 +193,19 @@ class LLLnode:
 
                 self.valency = 0
 
-                self.gas = counter_ptr.gas + start.gas
-                self.gas += 3  # gas for repeat_bound
+                self._gas = counter_ptr.gas + start.gas
+                self._gas += 3  # gas for repeat_bound
                 int_bound = int(repeat_bound.value)
-                self.gas += int_bound * (body.gas + 50) + 30
+                self._gas += int_bound * (body.gas + 50) + 30
 
                 if repeat_count != repeat_bound:
                     # gas for assert(repeat_count <= repeat_bound)
-                    self.gas += 18
+                    self._gas += 18
 
             # Seq statements: seq <statement> <statement> ...
             elif self.value == "seq":
                 self.valency = self.args[-1].valency if self.args else 0
-                self.gas = sum([arg.gas for arg in self.args]) + 30
+                self._gas = sum([arg.gas for arg in self.args]) + 30
 
             # GOTO is a jump with args
             # e.g. (goto my_label x y z) will push x y and z onto the stack,
@@ -220,19 +218,19 @@ class LLLnode:
                     )
 
                 self.valency = 0
-                self.gas = sum([arg.gas for arg in self.args])
+                self._gas = sum([arg.gas for arg in self.args])
             elif self.value == "label":
                 if not self.args[1].value == "var_list":
                     raise CodegenPanic(f"2nd argument to label must be var_list, {self}")
                 self.valency = 0
-                self.gas = 1 + sum(t.gas for t in self.args)
+                self._gas = 1 + sum(t.gas for t in self.args)
             # var_list names a variable number stack variables
             elif self.value == "var_list":
                 for arg in self.args:
                     if not isinstance(arg.value, str) or len(arg.args) > 0:
                         raise CodegenPanic(f"var_list only takes strings: {self.args}")
                 self.valency = 0
-                self.gas = 0
+                self._gas = 0
 
             # Multi statements: multi <expr> <expr> ...
             elif self.value == "multi":
@@ -241,39 +239,39 @@ class LLLnode:
                         arg.valency > 0, f"Multi expects all children to not be zerovalent: {arg}"
                     )
                 self.valency = sum([arg.valency for arg in self.args])
-                self.gas = sum([arg.gas for arg in self.args])
+                self._gas = sum([arg.gas for arg in self.args])
             elif self.value == "deploy":
                 self.valency = 0
-                self.gas = NullAttractor()  # unknown
+                self._gas = NullAttractor()  # unknown
             # Stack variables
             else:
                 self.valency = 1
-                self.gas = 3
+                self._gas = 3
         elif self.value is None:
             self.valency = 1
-            # None LLLnodes always get compiled into something else, e.g.
+            # None IRnodes always get compiled into something else, e.g.
             # mzero or PUSH1 0, and the gas will get re-estimated then.
-            self.gas = 3
+            self._gas = 3
         else:
-            raise CompilerPanic(f"Invalid value for LLL AST node: {self.value}")
+            raise CompilerPanic(f"Invalid value for IR AST node: {self.value}")
         assert isinstance(self.args, list)
 
-        if valency is not None:
-            self.valency = valency
+    # TODO would be nice to rename to `gas_estimate` or `gas_bound`
+    @property
+    def gas(self):
+        return self._gas + self.add_gas_estimate
 
-        self.gas += self.add_gas_estimate
-
-    # the LLL should be cached.
+    # the IR should be cached.
     # TODO make this private. turns out usages are all for the caching
     # idiom that cache_when_complex addresses
     @property
-    def is_complex_lll(self):
+    def is_complex_ir(self):
         # list of items not to cache. note can add other env variables
         # which do not change, e.g. calldatasize, coinbase, etc.
         do_not_cache = {"~empty"}
         return (
             isinstance(self.value, str)
-            and (self.value.lower() in VALID_LLL_MACROS or self.value.upper() in get_lll_opcodes())
+            and (self.value.lower() in VALID_IR_MACROS or self.value.upper() in get_ir_opcodes())
             and self.value.lower() not in do_not_cache
         )
 
@@ -281,48 +279,54 @@ class LLLnode:
     def is_literal(self):
         return isinstance(self.value, int) or self.value == "multi"
 
+    @property
+    def is_pointer(self):
+        # not used yet but should help refactor/clarify downstream code
+        # eventually
+        return self.location is not None
+
     # This function is slightly confusing but abstracts a common pattern:
-    # when an LLL value needs to be computed once and then cached as an
-    # LLL value (if it is expensive, or more importantly if its computation
-    # includes side-effects), cache it as an LLL variable named with the
+    # when an IR value needs to be computed once and then cached as an
+    # IR value (if it is expensive, or more importantly if its computation
+    # includes side-effects), cache it as an IR variable named with the
     # `name` param, and execute the `body` with the cached value. Otherwise,
-    # run the `body` without caching the LLL variable.
+    # run the `body` without caching the IR variable.
     # Note that this may be an unneeded abstraction in the presence of an
     # arbitrarily powerful optimization framework (which can detect unneeded
     # caches) but for now still necessary - CMC 2021-12-11.
     # usage:
     # ```
-    # with lll_node.cache_when_complex("foo") as builder, foo:
+    # with ir_node.cache_when_complex("foo") as builder, foo:
     #   ret = some_function(foo)
     #   return builder.resolve(ret)
     # ```
     def cache_when_complex(self, name):
-        # this creates a magical block which maps to LLL `with`
+        # this creates a magical block which maps to IR `with`
         class _WithBuilder:
-            def __init__(self, lll_node, name):
+            def __init__(self, ir_node, name):
                 # TODO figure out how to fix this circular import
-                from vyper.lll.optimizer import optimize
+                from vyper.ir.optimizer import optimize
 
-                self.lll_node = lll_node
-                # for caching purposes, see if the lll_node will be optimized
+                self.ir_node = ir_node
+                # for caching purposes, see if the ir_node will be optimized
                 # because a non-literal expr could turn into a literal,
                 # (e.g. `(add 1 2)`)
                 # TODO this could really be moved into optimizer.py
-                self.should_cache = optimize(lll_node).is_complex_lll
+                self.should_cache = optimize(ir_node).is_complex_ir
 
-                # a named LLL variable which represents the
-                # output of `lll_node`
-                self.lll_var = LLLnode.from_list(
-                    name, typ=lll_node.typ, location=lll_node.location, encoding=lll_node.encoding
+                # a named IR variable which represents the
+                # output of `ir_node`
+                self.ir_var = IRnode.from_list(
+                    name, typ=ir_node.typ, location=ir_node.location, encoding=ir_node.encoding
                 )
 
             def __enter__(self):
                 if self.should_cache:
                     # return the named cache
-                    return self, self.lll_var
+                    return self, self.ir_var
                 else:
                     # it's a constant (or will be optimized to one), just return that
-                    return self, self.lll_node
+                    return self, self.ir_node
 
             def __exit__(self, *args):
                 pass
@@ -331,9 +335,9 @@ class LLLnode:
             # in order to make sure the expression gets wrapped correctly
             def resolve(self, body):
                 if self.should_cache:
-                    ret = ["with", self.lll_var, self.lll_node, body]
-                    if isinstance(body, LLLnode):
-                        return LLLnode.from_list(
+                    ret = ["with", self.ir_var, self.ir_node, body]
+                    if isinstance(body, IRnode):
+                        return IRnode.from_list(
                             ret, typ=body.typ, location=body.location, encoding=body.encoding
                         )
                     else:
@@ -364,7 +368,7 @@ class LLLnode:
             and self.args == other.args
             and self.typ == other.typ
             and self.location == other.location
-            and self.pos == other.pos
+            and self.source_pos == other.source_pos
             and self.annotation == other.annotation
             and self.mutable == other.mutable
             and self.add_gas_estimate == other.add_gas_estimate
@@ -381,9 +385,9 @@ class LLLnode:
 
     @staticmethod
     def _colorise_keywords(val):
-        if val.lower() in VALID_LLL_MACROS:  # highlight macro
+        if val.lower() in VALID_IR_MACROS:  # highlight macro
             return OKLIGHTMAGENTA + val + ENDC
-        elif val.upper() in get_lll_opcodes().keys():
+        elif val.upper() in get_ir_opcodes().keys():
             return OKMAGENTA + val + ENDC
         return val
 
@@ -404,13 +408,13 @@ class LLLnode:
         if self.repr_show_gas and self.gas:
             o += OKBLUE + "{" + ENDC + str(self.gas) + OKBLUE + "} " + ENDC  # add gas for info.
         o += "[" + self._colorise_keywords(self.repr_value)
-        prev_lineno = self.pos[0] if self.pos else None
+        prev_lineno = self.source_pos[0] if self.source_pos else None
         arg_lineno = None
         annotated = False
         has_inner_newlines = False
         for arg in self.args:
             o += ",\n  "
-            arg_lineno = arg.pos[0] if arg.pos else None
+            arg_lineno = arg.source_pos[0] if arg.source_pos else None
             if arg_lineno is not None and arg_lineno != prev_lineno and self.value in ("seq", "if"):
                 o += f"# Line {(arg_lineno)}\n  "
                 prev_lineno = arg_lineno
@@ -440,24 +444,23 @@ class LLLnode:
         cls,
         obj: Any,
         typ: NodeType = None,
-        location: str = None,
-        pos: Tuple[int, int] = None,
+        location: Optional[AddrSpace] = None,
+        source_pos: Optional[Tuple[int, int]] = None,
         annotation: Optional[str] = None,
         mutable: bool = True,
         add_gas_estimate: int = 0,
-        valency: Optional[int] = None,
         encoding: Encoding = Encoding.VYPER,
-    ) -> "LLLnode":
+    ) -> "IRnode":
         if isinstance(typ, str):
             typ = BaseType(typ)
 
-        if isinstance(obj, LLLnode):
+        if isinstance(obj, IRnode):
             # note: this modify-and-returnclause is a little weird since
             # the input gets modified. CC 20191121.
             if typ is not None:
                 obj.typ = typ
-            if obj.pos is None:
-                obj.pos = pos
+            if obj.source_pos is None:
+                obj.source_pos = source_pos
             if obj.location is None:
                 obj.location = location
             if obj.encoding is None:
@@ -470,23 +473,20 @@ class LLLnode:
                 [],
                 typ,
                 location=location,
-                pos=pos,
                 annotation=annotation,
                 mutable=mutable,
                 add_gas_estimate=add_gas_estimate,
-                valency=valency,
                 encoding=encoding,
             )
         else:
             return cls(
                 obj[0],
-                [cls.from_list(o, pos=pos) for o in obj[1:]],
+                [cls.from_list(o, source_pos=source_pos) for o in obj[1:]],
                 typ,
                 location=location,
-                pos=pos,
                 annotation=annotation,
                 mutable=mutable,
+                source_pos=source_pos,
                 add_gas_estimate=add_gas_estimate,
-                valency=valency,
                 encoding=encoding,
             )
